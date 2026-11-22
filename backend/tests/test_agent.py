@@ -415,3 +415,34 @@ async def test_failed_step_can_be_retried(signed_in: httpx.AsyncClient, fake_pla
     ).json()
     assert retried["status"] == "running"
     assert retried["steps"][0]["run_id"] != failed["steps"][0]["run_id"]
+
+
+async def test_recent_turns_are_included_in_prompt(signed_in: httpx.AsyncClient, fake_planner):
+    session_id = (await open_session(signed_in))["id"]
+
+    fake_planner(AIMessage(content="好的"))
+    await send(signed_in, session_id, "把背景换成海滩")
+
+    second = fake_planner(AIMessage(content="明白"))
+    await send(signed_in, session_id, "再加一只海鸥")
+
+    system = second.messages[0].content
+    assert "把背景换成海滩" in system
+    assert "好的" in system
+    # 当前指令走 HumanMessage，不应重复出现在记忆里
+    assert "再加一只海鸥" not in system
+
+
+async def test_memory_keeps_only_recent_turns(signed_in: httpx.AsyncClient, fake_planner):
+    session_id = (await open_session(signed_in))["id"]
+    fake_planner(AIMessage(content="好的"))
+    for index in range(1, 7):
+        await send(signed_in, session_id, f"第{index}条指令")
+
+    last = fake_planner(AIMessage(content="明白"))
+    await send(signed_in, session_id, "第7条指令")
+
+    system = last.messages[0].content
+    assert "第1条指令" not in system
+    assert "第2条指令" in system
+    assert "第6条指令" in system

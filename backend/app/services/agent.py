@@ -15,6 +15,10 @@ from app.tools import spec_of
 
 logger = logging.getLogger(__name__)
 
+# 只带最近几轮：画布文档才是真正的长期状态，对话记忆只负责消解指代
+_MEMORY_TURNS = 5
+_MEMORY_CHARS = 120
+
 
 class TurnNotFound(Exception):
     pass
@@ -63,13 +67,44 @@ def _layer_name(layer: Layer) -> str:
     return name if layer.visible else f"{name}·隐藏"
 
 
+async def memory_of(
+    session: AsyncSession, record: EditSession, limit: int = _MEMORY_TURNS
+) -> str:
+    """最近几轮对话，用来理解“刚才那个”“再”之类的指代；更早的不带。"""
+    result = await session.scalars(
+        select(AgentRun)
+        .where(AgentRun.session_id == record.id)
+        .order_by(AgentRun.created_at.desc())
+        .limit(limit)
+    )
+    turns = list(reversed(list(result)))
+    if not turns:
+        return ""
+
+    lines: list[str] = []
+    for turn in turns:
+        lines.append(f"用户：{_clip(turn.goal)}")
+        reply = _clip(turn.reply) if turn.reply else "（无回复）"
+        if turn.status is RunStatus.FAILED:
+            reply += "（执行失败）"
+        lines.append(f"助手：{reply}")
+    return "\n".join(lines)
+
+
+def _clip(text: str, limit: int = _MEMORY_CHARS) -> str:
+    flat = " ".join(text.split())
+    return flat if len(flat) <= limit else flat[:limit].rstrip() + "…"
+
+
 async def respond(session: AsyncSession, record: EditSession, goal: str) -> AgentRun:
     """规划一轮指令并落库。多步计划先停住等确认，单步直接开跑。"""
     revision = record.revision
     reply, steps, error = "", [], None
 
     try:
-        reply, steps = await agent.run(goal, await describe(session, record))
+        reply, steps = await agent.run(
+            goal, await describe(session, record), await memory_of(session, record)
+        )
         steps = await _pin_selection(session, record, steps)
     except agent.PlannerUnavailable as exc:
         error = str(exc)
