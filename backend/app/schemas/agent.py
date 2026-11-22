@@ -64,5 +64,9 @@ class TurnOut(BaseModel):
             status=turn.status,
             error=turn.error,
             created_at=turn.created_at,
-            steps=[PlanStepOut.of(step) for step in turn.plan],
+            steps=[
+                PlanStepOut.of(step)
+                for step in turn.plan
+                if not step.get("superseded")
+            ],
         )

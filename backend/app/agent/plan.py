@@ -66,8 +66,8 @@ def ready(steps: list[dict]) -> list[dict]:
 
 
 def settle(steps: list[dict]) -> str:
-    """根据步骤状态汇总整轮计划。"""
-    statuses = [step["status"] for step in steps]
+    """根据步骤状态汇总整轮计划；被重规划替换的失败步骤不计入。"""
+    statuses = [step["status"] for step in steps if not step.get("superseded")]
     if any(status in _OPEN for status in statuses):
         if any(status == WAITING for status in statuses) and not any(
             status in {QUEUED, RUNNING} for status in statuses
@@ -82,7 +82,7 @@ def settle(steps: list[dict]) -> str:
 
 
 def needs_confirm(steps: list[dict]) -> bool:
-    return len(steps) > 1
+    return len([step for step in steps if not step.get("superseded")]) > 1
 
 
 def cancel_remaining(steps: list[dict]) -> list[dict]:

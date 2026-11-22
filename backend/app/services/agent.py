@@ -10,7 +10,7 @@ from app.agent import plan as plan_mod
 from app.layers import Layer, LayerDocument, LayerKind
 from app.models import AgentRun, EditSession, ToolRun
 from app.models.tool_run import RunStatus
-from app.services import assets, runs, selections, tools
+from app.services import assets, runs, selections, sessions, tools
 from app.tools import spec_of
 
 logger = logging.getLogger(__name__)
@@ -222,6 +222,8 @@ async def continue_plan(session: AsyncSession, run: ToolRun) -> None:
             step["status"] = run.status.value
     turn.plan = steps
     _touch(turn)
+    if run.status is RunStatus.FAILED and await _reflect(session, turn, run, steps):
+        return
     # 先不落库：同步的下一步（如翻转）跟这次一起提交，前端不会捞到「上一步完了、下一步还没开始」
     await _advance(session, turn)
 
@@ -234,6 +236,61 @@ async def turns_of(session: AsyncSession, record: EditSession, limit: int = 50) 
         .limit(limit)
     )
     return list(result)
+
+
+async def _reflect(
+    session: AsyncSession, turn: AgentRun, run: ToolRun, steps: list[dict]
+) -> bool:
+    """失败后自动重规划一次；返回是否已接管本次推进。
+
+    每轮计划最多重规划一次：只要已有步骤被标记过 replanned，就不再重试。
+    """
+    if any(step.get("replanned") for step in steps):
+        return False
+    failed = next((step for step in steps if step.get("run_id") == str(run.id)), None)
+    if failed is None:
+        return False
+    try:
+        record = await sessions.load(session, turn.session_id)
+    except sessions.SessionNotFound:
+        return False
+
+    error = run.error or "执行失败，请重试"
+    remaining = [step["tool"] for step in steps if step["status"] == plan_mod.PENDING]
+    try:
+        reply, revised = await agent.revise(
+            turn.goal,
+            await describe(session, record),
+            await memory_of(session, record),
+            failed,
+            error,
+            remaining,
+        )
+    except Exception:
+        logger.exception("自动重规划异常 turn_id=%s", turn.id)
+        return False
+
+    failed["replanned"] = True
+    steps = plan_mod.cancel_remaining(steps)
+    if not revised:
+        turn.plan = steps
+        turn.error = error
+        turn.status = RunStatus(plan_mod.settle(steps))
+        _touch(turn)
+        await session.commit()
+        await session.refresh(turn)
+        return True
+
+    failed["superseded"] = True
+    turn.plan = steps + revised
+    turn.reply = f"上一步没有成功，已重新规划。{reply}"
+    turn.error = None
+    turn.status = RunStatus.QUEUED if plan_mod.needs_confirm(revised) else RunStatus.RUNNING
+    _touch(turn)
+    await session.commit()
+    if turn.status is RunStatus.RUNNING:
+        await _advance(session, turn)
+    return True
 
 
 async def _advance(session: AsyncSession, turn: AgentRun) -> AgentRun:

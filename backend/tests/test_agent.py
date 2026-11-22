@@ -23,10 +23,31 @@ class FakePlanner:
         return self._message
 
 
+class SequencePlanner:
+    def __init__(self, messages: list[AIMessage]) -> None:
+        self._messages = messages
+        self.calls: list[list] = []
+
+    async def ainvoke(self, messages):
+        self.calls.append(messages)
+        index = min(len(self.calls) - 1, len(self._messages) - 1)
+        return self._messages[index]
+
+
 @pytest.fixture
 def fake_planner(monkeypatch):
     def install(message: AIMessage) -> FakePlanner:
         fake = FakePlanner(message)
+        monkeypatch.setattr(graph, "planner", lambda: fake)
+        return fake
+
+    return install
+
+
+@pytest.fixture
+def sequence_planner(monkeypatch):
+    def install(*messages: AIMessage) -> SequencePlanner:
+        fake = SequencePlanner(list(messages))
         monkeypatch.setattr(graph, "planner", lambda: fake)
         return fake
 
@@ -361,13 +382,14 @@ async def test_two_layers_in_one_turn_share_the_same_selection(
 
 
 async def test_selection_expires_when_the_plan_changes_the_canvas(
-    signed_in: httpx.AsyncClient, fake_planner
+    signed_in: httpx.AsyncClient, sequence_planner
 ):
-    fake_planner(
+    sequence_planner(
         tool_calls(
             ("crop_canvas", {"ratio": "1:1"}),
             ("replace_region", {"prompt": "改成红色"}),
-        )
+        ),
+        AIMessage(content="无法修正"),
     )
     session = await open_session(signed_in)
     await select(signed_in, session["id"], session["revision"], points=[{"x": 0.5, "y": 0.5}])
@@ -401,8 +423,11 @@ async def test_cancel_drops_unstarted_steps(signed_in: httpx.AsyncClient, fake_p
     assert session["document"]["layers"][0]["transform"]["scale_x"] == 1
 
 
-async def test_failed_step_can_be_retried(signed_in: httpx.AsyncClient, fake_planner):
-    fake_planner(tool_call("replace_region", {"prompt": "改成黑色", "layer_id": "不存在的层"}))
+async def test_failed_step_can_be_retried(signed_in: httpx.AsyncClient, sequence_planner):
+    sequence_planner(
+        tool_call("replace_region", {"prompt": "改成黑色", "layer_id": "不存在的层"}),
+        AIMessage(content="无法修正"),
+    )
     session_id = (await open_session(signed_in))["id"]
     turn = await send(signed_in, session_id, "把不存在的层换成黑色")
 
@@ -446,3 +471,42 @@ async def test_memory_keeps_only_recent_turns(signed_in: httpx.AsyncClient, fake
     assert "第1条指令" not in system
     assert "第2条指令" in system
     assert "第6条指令" in system
+
+
+async def test_failed_step_is_replanned(signed_in: httpx.AsyncClient, sequence_planner):
+    sequence_planner(
+        tool_call("replace_region", {"prompt": "改成黑色", "layer_id": "不存在的层"}),
+        tool_call("flip_layer", {"direction": "horizontal"}),
+    )
+    session_id = (await open_session(signed_in))["id"]
+    turn = await send(signed_in, session_id, "把不存在的层换成黑色")
+
+    await run_tool({}, uuid.UUID(turn["steps"][0]["run_id"]))
+
+    last = (await signed_in.get(f"/api/sessions/{session_id}/messages")).json()[-1]
+    assert last["status"] == "succeeded"
+    assert [step["tool"] for step in last["steps"]] == ["flip_layer"]
+    assert "已重新规划" in last["reply"]
+
+
+async def test_replan_is_attempted_only_once(signed_in: httpx.AsyncClient, sequence_planner):
+    planner = sequence_planner(
+        tool_call("replace_region", {"prompt": "改成黑色", "layer_id": "不存在的层"}),
+        tool_call("replace_region", {"prompt": "改成白色", "layer_id": "还是不存在的层"}),
+    )
+    session_id = (await open_session(signed_in))["id"]
+    turn = await send(signed_in, session_id, "把不存在的层换成黑色")
+    await run_tool({}, uuid.UUID(turn["steps"][0]["run_id"]))
+
+    queued = next(
+        step
+        for step in (
+            await signed_in.get(f"/api/sessions/{session_id}/messages")
+        ).json()[-1]["steps"]
+        if step["status"] == "queued"
+    )
+    await run_tool({}, uuid.UUID(queued["run_id"]))
+
+    last = (await signed_in.get(f"/api/sessions/{session_id}/messages")).json()[-1]
+    assert last["status"] == "failed"
+    assert len(planner.calls) == 2

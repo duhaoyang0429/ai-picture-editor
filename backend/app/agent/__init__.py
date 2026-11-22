@@ -1,4 +1,4 @@
-from app.agent.graph import run
+from app.agent.graph import revise, run
 from app.agent.llm import PlannerUnavailable
 
-__all__ = ["PlannerUnavailable", "run"]
+__all__ = ["PlannerUnavailable", "revise", "run"]

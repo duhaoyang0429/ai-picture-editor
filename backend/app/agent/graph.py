@@ -96,6 +96,47 @@ async def run(goal: str, context: str, memory: str = "") -> tuple[str, list[dict
     return spoken(state["reply"], state["plan"]), state["plan"]
 
 
+async def revise(
+    goal: str,
+    context: str,
+    memory: str,
+    failed: dict,
+    error: str,
+    remaining: list[str],
+) -> tuple[str, list[dict]]:
+    """失败后带错误信息重新规划一次，只返回修正后的剩余步骤。"""
+    notice = (
+        "上一版计划执行失败，请只给出修正后的剩余步骤。\n"
+        f"原目标：{goal}\n"
+        f"失败的工具：{failed['tool']}\n"
+        f"失败原因：{error}\n"
+        f"尚未执行的工具：{'、'.join(remaining) or '无'}\n"
+        "已经成功的步骤不要重复；无法修正时不要调用工具，只用一句话说明。"
+    )
+    message = await planner().ainvoke(
+        [
+            SystemMessage(
+                _SYSTEM.format(context=context, memory=memory or "（无）")
+            ),
+            HumanMessage(notice),
+        ]
+    )
+    raw = [
+        {
+            "id": f"r{index}",
+            "tool": call["name"],
+            "params": call["args"],
+            "depends_on": [f"r{index - 1}"] if index > 1 else [],
+        }
+        for index, call in enumerate(message.tool_calls, start=1)
+    ]
+    try:
+        plan = validate(raw)
+    except (UnknownTool, tool_service.InvalidParams, PlanError) as exc:
+        return f"自动重试没有找到可行的方案：{exc}", []
+    return spoken(_text_of(message), plan), plan
+
+
 def spoken(reply: str, plan: list[dict]) -> str:
     """有计划就按步骤说话；没计划才用兜底或截成一句拒绝。"""
     text = (reply or "").strip()
